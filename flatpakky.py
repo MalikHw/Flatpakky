@@ -2,6 +2,7 @@
 """
 Flatpakky - A Flathub-like browser for Flatpaks
 Created by MalikHw47
+Enhanced version with improved features
 """
 
 import sys
@@ -10,18 +11,21 @@ import json
 import subprocess
 import threading
 import webbrowser
+import time
 from typing import Dict, List, Optional, Any
 from urllib.request import urlopen, Request
 from urllib.parse import quote
+from urllib.error import URLError, HTTPError
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QListWidget, QListWidgetItem, QLabel, QPushButton,
     QLineEdit, QTextEdit, QProgressBar, QStatusBar, QFrame,
     QScrollArea, QGroupBox, QCheckBox, QMessageBox, QFileDialog,
     QTreeWidget, QTreeWidgetItem, QTabWidget, QGridLayout,
-    QComboBox, QSpinBox, QDialog, QDialogButtonBox
+    QComboBox, QSpinBox, QDialog, QDialogButtonBox, QSystemTrayIcon,
+    QMenu, QStyle, QSizePolicy
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QSize
 from PyQt6.QtGui import QPixmap, QIcon, QFont, QAction, QDesktopServices
 import tempfile
 import urllib.request
@@ -33,6 +37,7 @@ class FlatpakAPI:
         self.base_url = "https://flathub.org/api/v1"
         self.apps_cache = {}
         self.icons_cache = {}
+        self.last_error = None
     
     def search_apps(self, query: str = "") -> List[Dict]:
         """Search for apps on Flathub"""
@@ -45,8 +50,10 @@ class FlatpakAPI:
             req = Request(url, headers={'User-Agent': 'Flatpakky/1.0'})
             with urlopen(req, timeout=10) as response:
                 data = json.loads(response.read().decode())
+                self.last_error = None
                 return data if isinstance(data, list) else []
-        except Exception as e:
+        except (URLError, HTTPError, json.JSONDecodeError) as e:
+            self.last_error = str(e)
             print(f"Error searching apps: {e}")
             return []
     
@@ -56,8 +63,10 @@ class FlatpakAPI:
             url = f"{self.base_url}/apps/{app_id}"
             req = Request(url, headers={'User-Agent': 'Flatpakky/1.0'})
             with urlopen(req, timeout=10) as response:
+                self.last_error = None
                 return json.loads(response.read().decode())
-        except Exception as e:
+        except (URLError, HTTPError, json.JSONDecodeError) as e:
+            self.last_error = str(e)
             print(f"Error getting app details: {e}")
             return {}
     
@@ -80,8 +89,10 @@ class FlatpakAPI:
                             'branch': parts[3],
                             'origin': parts[4]
                         })
+            self.last_error = None
             return apps
         except Exception as e:
+            self.last_error = str(e)
             print(f"Error getting installed apps: {e}")
             return []
     
@@ -92,8 +103,10 @@ class FlatpakAPI:
                 ['flatpak', 'install', 'flathub', app_id, '-y'],
                 check=True
             )
+            self.last_error = None
             return True
         except Exception as e:
+            self.last_error = str(e)
             print(f"Error installing app: {e}")
             return False
     
@@ -104,8 +117,10 @@ class FlatpakAPI:
                 ['flatpak', 'uninstall', app_id, '-y'],
                 check=True
             )
+            self.last_error = None
             return True
         except Exception as e:
+            self.last_error = str(e)
             print(f"Error uninstalling app: {e}")
             return False
     
@@ -116,8 +131,10 @@ class FlatpakAPI:
                 ['flatpak', 'update', app_id, '-y'],
                 check=True
             )
+            self.last_error = None
             return True
         except Exception as e:
+            self.last_error = str(e)
             print(f"Error updating app: {e}")
             return False
     
@@ -128,14 +145,17 @@ class FlatpakAPI:
                 ['flatpak', 'update', '-y'],
                 check=True
             )
+            self.last_error = None
             return True
         except Exception as e:
+            self.last_error = str(e)
             print(f"Error updating all apps: {e}")
             return False
 
 class IconLoader(QThread):
     """Thread for loading app icons"""
     icon_loaded = pyqtSignal(str, QPixmap)
+    icon_failed = pyqtSignal(str)
     
     def __init__(self, app_id: str, icon_url: str):
         super().__init__()
@@ -152,8 +172,11 @@ class IconLoader(QThread):
                 if not pixmap.isNull():
                     pixmap = pixmap.scaled(64, 64, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
                     self.icon_loaded.emit(self.app_id, pixmap)
+                else:
+                    self.icon_failed.emit(self.app_id)
         except Exception as e:
             print(f"Error loading icon for {self.app_id}: {e}")
+            self.icon_failed.emit(self.app_id)
 
 class AppWorker(QThread):
     """Worker thread for app operations"""
@@ -186,6 +209,26 @@ class AppWorker(QThread):
                 self.operation_finished.emit(success, "update_all")
         except Exception as e:
             self.operation_finished.emit(False, self.operation)
+
+class SearchThrottleTimer(QTimer):
+    """Timer for throttling search requests"""
+    search_requested = pyqtSignal(str)
+    
+    def __init__(self, delay_ms: int = 2000):
+        super().__init__()
+        self.delay_ms = delay_ms
+        self.pending_query = ""
+        self.setSingleShot(True)
+        self.timeout.connect(self.perform_search)
+    
+    def request_search(self, query: str):
+        """Request a search with throttling"""
+        self.pending_query = query
+        self.start(self.delay_ms)
+    
+    def perform_search(self):
+        """Perform the actual search"""
+        self.search_requested.emit(self.pending_query)
 
 class BatchDownloadDialog(QDialog):
     """Dialog for batch downloading apps"""
@@ -228,7 +271,7 @@ class AdvancedSettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Advanced Settings")
         self.setModal(True)
-        self.resize(400, 300)
+        self.resize(500, 400)
         
         layout = QVBoxLayout()
         
@@ -243,8 +286,11 @@ class AdvancedSettingsDialog(QDialog):
         remotes_buttons = QHBoxLayout()
         add_remote_btn = QPushButton("Add Remote")
         remove_remote_btn = QPushButton("Remove Remote")
+        refresh_remotes_btn = QPushButton("Refresh")
+        refresh_remotes_btn.clicked.connect(self.load_remotes)
         remotes_buttons.addWidget(add_remote_btn)
         remotes_buttons.addWidget(remove_remote_btn)
+        remotes_buttons.addWidget(refresh_remotes_btn)
         remotes_layout.addLayout(remotes_buttons)
         
         remotes_group.setLayout(remotes_layout)
@@ -264,6 +310,17 @@ class AdvancedSettingsDialog(QDialog):
         self.parallel_downloads.setValue(3)
         settings_layout.addWidget(self.parallel_downloads, 1, 1)
         
+        settings_layout.addWidget(QLabel("Enable system tray:"), 2, 0)
+        self.enable_tray_check = QCheckBox()
+        self.enable_tray_check.setChecked(True)
+        settings_layout.addWidget(self.enable_tray_check, 2, 1)
+        
+        settings_layout.addWidget(QLabel("Search delay (ms):"), 3, 0)
+        self.search_delay = QSpinBox()
+        self.search_delay.setRange(500, 5000)
+        self.search_delay.setValue(2000)
+        settings_layout.addWidget(self.search_delay, 3, 1)
+        
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
         
@@ -279,6 +336,7 @@ class AdvancedSettingsDialog(QDialog):
     
     def load_remotes(self):
         """Load Flatpak remotes"""
+        self.remotes_tree.clear()
         try:
             result = subprocess.run(
                 ['flatpak', 'remotes', '--columns=name,url,options'],
@@ -293,6 +351,50 @@ class AdvancedSettingsDialog(QDialog):
         except Exception as e:
             print(f"Error loading remotes: {e}")
 
+class ErrorDialog(QDialog):
+    """Dialog for showing errors with retry option"""
+    
+    def __init__(self, title: str, message: str, error_details: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.resize(400, 250)
+        
+        layout = QVBoxLayout()
+        
+        # Error message
+        error_label = QLabel(message)
+        error_label.setWordWrap(True)
+        layout.addWidget(error_label)
+        
+        # Error details (if provided)
+        if error_details:
+            details_group = QGroupBox("Error Details")
+            details_layout = QVBoxLayout()
+            
+            details_text = QTextEdit()
+            details_text.setPlainText(error_details)
+            details_text.setReadOnly(True)
+            details_text.setMaximumHeight(100)
+            details_layout.addWidget(details_text)
+            
+            details_group.setLayout(details_layout)
+            layout.addWidget(details_group)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        self.retry_button = QPushButton("Retry")
+        self.retry_button.clicked.connect(self.accept)
+        button_layout.addWidget(self.retry_button)
+        
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        button_layout.addWidget(close_button)
+        
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
 class FlatpakkyMainWindow(QMainWindow):
     """Main application window"""
     
@@ -304,8 +406,15 @@ class FlatpakkyMainWindow(QMainWindow):
         self.selected_app = None
         self.icon_loaders = []
         self.app_icons = {}
+        self.loading_icons = set()
+        self.tray_icon = None
+        
+        # Search throttle timer
+        self.search_timer = SearchThrottleTimer(2000)
+        self.search_timer.search_requested.connect(self.perform_search)
         
         self.init_ui()
+        self.setup_tray_icon()
         self.load_installed_apps()
         self.load_apps()
         
@@ -314,13 +423,28 @@ class FlatpakkyMainWindow(QMainWindow):
         self.update_timer.timeout.connect(self.check_for_updates)
         self.update_timer.start(300000)  # Check every 5 minutes
     
+    def get_app_icon(self):
+        """Get application icon from logo.png or use default"""
+        icon_paths = [
+            "logo.png",  # Same directory as script
+            os.path.join(os.path.dirname(__file__), "logo.png"),  # Explicit path
+            os.path.join(sys._MEIPASS, "logo.png") if hasattr(sys, '_MEIPASS') else None,  # PyInstaller bundle
+        ]
+        
+        for path in icon_paths:
+            if path and os.path.exists(path):
+                return QIcon(path)
+        
+        # Use default application icon
+        return self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+    
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("Flatpakky - Flathub Browser")
         self.setGeometry(100, 100, 1200, 800)
         
         # Set application icon
-        self.setWindowIcon(QIcon())
+        self.setWindowIcon(self.get_app_icon())
         
         # Create central widget
         central_widget = QWidget()
@@ -348,9 +472,16 @@ class FlatpakkyMainWindow(QMainWindow):
         header_layout.addWidget(search_icon)
         
         self.search_bar = QLineEdit()
-        self.search_bar.setPlaceholderText("Search Flathub")
-        self.search_bar.returnPressed.connect(self.search_apps)
+        self.search_bar.setPlaceholderText("Search Flathub (auto-search after 2 seconds)")
+        self.search_bar.textChanged.connect(self.on_search_text_changed)
+        self.search_bar.returnPressed.connect(self.search_apps_immediately)
         header_layout.addWidget(self.search_bar)
+        
+        # Retry button (initially hidden)
+        self.retry_button = QPushButton("🔄 Retry")
+        self.retry_button.clicked.connect(self.retry_last_operation)
+        self.retry_button.setVisible(False)
+        header_layout.addWidget(self.retry_button)
         
         main_layout.addLayout(header_layout)
         
@@ -418,6 +549,7 @@ class FlatpakkyMainWindow(QMainWindow):
         self.app_icon.setFixedSize(64, 64)
         self.app_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.app_icon.setStyleSheet("border: 1px solid gray;")
+        self.app_icon.setText("Select an app")
         details_layout.addWidget(self.app_icon)
         
         # App info
@@ -453,7 +585,7 @@ class FlatpakkyMainWindow(QMainWindow):
         # Control buttons
         controls_layout = QHBoxLayout()
         
-        self.update_button = QPushButton("Update")
+        self.update_button = QPushButton("Update All")
         self.update_button.clicked.connect(self.update_all_apps)
         controls_layout.addWidget(self.update_button)
         
@@ -486,6 +618,57 @@ class FlatpakkyMainWindow(QMainWindow):
         # Create menu bar
         self.create_menu_bar()
     
+    def setup_tray_icon(self):
+        """Set up system tray icon"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.get_app_icon())
+        self.tray_icon.setToolTip("Flatpakky - Flathub Browser")
+        
+        # Create tray menu
+        tray_menu = QMenu()
+        
+        show_action = QAction("Show", self)
+        show_action.triggered.connect(self.show_window)
+        tray_menu.addAction(show_action)
+        
+        hide_action = QAction("Hide", self)
+        hide_action.triggered.connect(self.hide)
+        tray_menu.addAction(hide_action)
+        
+        tray_menu.addSeparator()
+        
+        update_action = QAction("Update All", self)
+        update_action.triggered.connect(self.update_all_apps)
+        tray_menu.addAction(update_action)
+        
+        tray_menu.addSeparator()
+        
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.quit_application)
+        tray_menu.addAction(quit_action)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+    
+    def on_tray_activated(self, reason):
+        """Handle tray icon activation"""
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show_window()
+    
+    def show_window(self):
+        """Show and raise the main window"""
+        self.show()
+        self.raise_()
+        self.activateWindow()
+    
+    def quit_application(self):
+        """Quit the application"""
+        self.close()
+    
     def create_menu_bar(self):
         """Create menu bar with various options"""
         menubar = self.menuBar()
@@ -504,6 +687,11 @@ class FlatpakkyMainWindow(QMainWindow):
         file_menu.addAction(install_file_action)
         
         file_menu.addSeparator()
+        
+        # Minimize to tray action
+        minimize_action = QAction('Minimize to Tray', self)
+        minimize_action.triggered.connect(self.hide)
+        file_menu.addAction(minimize_action)
         
         # Exit action
         exit_action = QAction('Exit', self)
@@ -535,6 +723,26 @@ class FlatpakkyMainWindow(QMainWindow):
         about_action.triggered.connect(self.show_about)
         help_menu.addAction(about_action)
     
+    def on_search_text_changed(self, text):
+        """Handle search text changes with throttling"""
+        self.search_timer.request_search(text.strip())
+    
+    def search_apps_immediately(self):
+        """Search apps immediately when Enter is pressed"""
+        self.search_timer.stop()
+        query = self.search_bar.text().strip()
+        self.perform_search(query)
+    
+    def perform_search(self, query: str):
+        """Perform the actual search"""
+        self.load_apps(query)
+    
+    def retry_last_operation(self):
+        """Retry the last failed operation"""
+        self.retry_button.setVisible(False)
+        query = self.search_bar.text().strip()
+        self.load_apps(query)
+    
     def load_apps(self, query: str = ""):
         """Load apps from Flathub"""
         self.progress_bar.setVisible(True)
@@ -544,10 +752,28 @@ class FlatpakkyMainWindow(QMainWindow):
         # Load apps in a separate thread
         def load_apps_thread():
             apps = self.api.search_apps(query)
-            self.current_apps = apps
             
             # Update UI in main thread
             QApplication.instance().processEvents()
+            
+            if not apps and self.api.last_error:
+                # Show error and retry button
+                self.retry_button.setVisible(True)
+                self.status_bar.showMessage(f"Failed to load apps: {self.api.last_error}")
+                self.progress_bar.setVisible(False)
+                
+                # Show error dialog
+                error_dialog = ErrorDialog(
+                    "Connection Error",
+                    "Failed to connect to Flathub. Please check your internet connection.",
+                    self.api.last_error,
+                    self
+                )
+                if error_dialog.exec() == QDialog.DialogCode.Accepted:
+                    self.retry_last_operation()
+                return
+            
+            self.current_apps = apps
             self.app_list.clear()
             
             for app in apps:
@@ -575,26 +801,32 @@ class FlatpakkyMainWindow(QMainWindow):
     
     def load_app_icon(self, app_id: str, icon_url: str):
         """Load app icon asynchronously"""
-        if app_id in self.app_icons:
+        if app_id in self.app_icons or app_id in self.loading_icons:
             return
         
+        self.loading_icons.add(app_id)
         icon_loader = IconLoader(app_id, icon_url)
         icon_loader.icon_loaded.connect(self.on_icon_loaded)
+        icon_loader.icon_failed.connect(self.on_icon_failed)
         icon_loader.start()
         self.icon_loaders.append(icon_loader)
     
     def on_icon_loaded(self, app_id: str, pixmap: QPixmap):
         """Handle icon loaded signal"""
         self.app_icons[app_id] = pixmap
+        self.loading_icons.discard(app_id)
         
         # Update current app display if it matches
         if self.selected_app and self.selected_app.get('flatpakAppId') == app_id:
             self.app_icon.setPixmap(pixmap)
     
-    def search_apps(self):
-        """Search for apps"""
-        query = self.search_bar.text().strip()
-        self.load_apps(query)
+    def on_icon_failed(self, app_id: str):
+        """Handle icon loading failure"""
+        self.loading_icons.discard(app_id)
+        
+        # Update current app display if it matches
+        if self.selected_app and self.selected_app.get('flatpakAppId') == app_id:
+            self.app_icon.setText("No Icon")
     
     def on_app_selected(self):
         """Handle app selection"""
@@ -629,6 +861,9 @@ class FlatpakkyMainWindow(QMainWindow):
         # Update app icon
         if app_id in self.app_icons:
             self.app_icon.setPixmap(self.app_icons[app_id])
+        elif app_id in self.loading_icons:
+            self.app_icon.clear()
+            self.app_icon.setText("Loading...")
         else:
             self.app_icon.clear()
             self.app_icon.setText("No Icon")
@@ -708,6 +943,15 @@ class FlatpakkyMainWindow(QMainWindow):
         
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
+        
+        # Show tray notification if available
+        if self.tray_icon and self.tray_icon.isVisible():
+            self.tray_icon.showMessage(
+                "Flatpakky", 
+                "Updating all applications...", 
+                QSystemTrayIcon.MessageIcon.Information, 
+                3000
+            )
     
     def on_operation_finished(self, success: bool, operation: str):
         """Handle operation completion"""
@@ -717,9 +961,43 @@ class FlatpakkyMainWindow(QMainWindow):
             self.status_bar.showMessage(f"Operation completed successfully", 3000)
             self.load_installed_apps()
             self.update_app_details()
+            
+            # Show tray notification if available
+            if self.tray_icon and self.tray_icon.isVisible():
+                self.tray_icon.showMessage(
+                    "Flatpakky", 
+                    f"{operation.replace('_', ' ').title()} completed successfully!", 
+                    QSystemTrayIcon.MessageIcon.Information, 
+                    3000
+                )
         else:
             self.status_bar.showMessage(f"Operation failed", 3000)
-            QMessageBox.warning(self, "Operation Failed", f"The {operation} operation failed. Please check your internet connection and try again.")
+            
+            # Show error dialog with retry option
+            error_dialog = ErrorDialog(
+                "Operation Failed",
+                f"The {operation.replace('_', ' ')} operation failed. Please try again.",
+                self.api.last_error or "Unknown error occurred",
+                self
+            )
+            
+            if error_dialog.exec() == QDialog.DialogCode.Accepted:
+                # Retry the operation
+                if operation == "install":
+                    self.install_app()
+                elif operation == "uninstall":
+                    self.uninstall_app()
+                elif operation == "update_all":
+                    self.update_all_apps()
+            
+            # Show tray notification if available
+            if self.tray_icon and self.tray_icon.isVisible():
+                self.tray_icon.showMessage(
+                    "Flatpakky", 
+                    f"{operation.replace('_', ' ').title()} failed!", 
+                    QSystemTrayIcon.MessageIcon.Critical, 
+                    3000
+                )
         
         # Re-enable buttons
         if hasattr(self, 'selected_app') and self.selected_app:
@@ -733,7 +1011,20 @@ class FlatpakkyMainWindow(QMainWindow):
     def show_advanced_settings(self):
         """Show advanced settings dialog"""
         dialog = AdvancedSettingsDialog(self)
-        dialog.exec()
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Apply settings
+            if hasattr(dialog, 'search_delay'):
+                self.search_timer.delay_ms = dialog.search_delay.value()
+            
+            if hasattr(dialog, 'enable_tray_check'):
+                if dialog.enable_tray_check.isChecked():
+                    if not self.tray_icon:
+                        self.setup_tray_icon()
+                    elif not self.tray_icon.isVisible():
+                        self.tray_icon.show()
+                else:
+                    if self.tray_icon and self.tray_icon.isVisible():
+                        self.tray_icon.hide()
     
     def show_batch_download(self):
         """Show batch download dialog"""
@@ -746,12 +1037,29 @@ class FlatpakkyMainWindow(QMainWindow):
     def batch_install_apps(self, app_ids: List[str]):
         """Install multiple apps in batch"""
         def install_batch():
-            for app_id in app_ids:
-                self.status_bar.showMessage(f"Installing {app_id}...")
-                self.api.install_app(app_id)
+            successful = 0
+            failed = 0
             
-            self.status_bar.showMessage("Batch installation completed")
+            for i, app_id in enumerate(app_ids):
+                self.status_bar.showMessage(f"Installing {app_id} ({i+1}/{len(app_ids)})...")
+                QApplication.processEvents()
+                
+                if self.api.install_app(app_id):
+                    successful += 1
+                else:
+                    failed += 1
+            
+            self.status_bar.showMessage(f"Batch installation completed: {successful} successful, {failed} failed")
             self.load_installed_apps()
+            
+            # Show tray notification if available
+            if self.tray_icon and self.tray_icon.isVisible():
+                self.tray_icon.showMessage(
+                    "Flatpakky", 
+                    f"Batch installation completed: {successful} successful, {failed} failed", 
+                    QSystemTrayIcon.MessageIcon.Information, 
+                    5000
+                )
         
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
@@ -771,8 +1079,23 @@ class FlatpakkyMainWindow(QMainWindow):
                 subprocess.run(['flatpak', 'install', file_path, '-y'], check=True)
                 self.status_bar.showMessage("Installation from file completed", 3000)
                 self.load_installed_apps()
+                
+                # Show tray notification if available
+                if self.tray_icon and self.tray_icon.isVisible():
+                    self.tray_icon.showMessage(
+                        "Flatpakky", 
+                        "Installation from file completed!", 
+                        QSystemTrayIcon.MessageIcon.Information, 
+                        3000
+                    )
             except Exception as e:
-                QMessageBox.warning(self, "Installation Failed", f"Failed to install from file: {str(e)}")
+                error_dialog = ErrorDialog(
+                    "Installation Failed",
+                    f"Failed to install from file: {os.path.basename(file_path)}",
+                    str(e),
+                    self
+                )
+                error_dialog.exec()
     
     def check_for_updates(self):
         """Check for available updates"""
@@ -783,6 +1106,15 @@ class FlatpakkyMainWindow(QMainWindow):
             )
             updates = len(result.stdout.strip().split('\n')) if result.stdout.strip() else 0
             self.update_status(updates)
+            
+            # Show tray notification for updates if available
+            if updates > 0 and self.tray_icon and self.tray_icon.isVisible():
+                self.tray_icon.showMessage(
+                    "Flatpakky", 
+                    f"{updates} app updates available!", 
+                    QSystemTrayIcon.MessageIcon.Information, 
+                    5000
+                )
         except Exception:
             pass
     
@@ -798,34 +1130,77 @@ class FlatpakkyMainWindow(QMainWindow):
         """Show about dialog"""
         QMessageBox.about(
             self, "About Flatpakky",
-            "Flatpakky v1.0\n\n"
+            "Flatpakky v1.1 Enhanced\n\n"
             "A Flathub-like browser for Flatpaks\n"
             "Created by MalikHw47\n\n"
-            "Features:\n"
+            "Enhanced Features:\n"
             "• Browse and search Flathub applications\n"
             "• Install and uninstall Flatpak packages\n"
             "• Batch downloading support\n"
             "• .flatpakref file support\n"
-            "• Icon and category support\n\n"
+            "• Icon and category support\n"
+            "• Search throttling for better performance\n"
+            "• System tray support\n"
+            "• Error handling with retry functionality\n"
+            "• Loading indicators for icons\n\n"
             "Support the developer:\n"
             "• Ko-fi: https://www.ko-fi.com/MalikHw47\n"
             "• YouTube: https://youtube.com/@malikhw47\n"
             "• GitHub: https://github.com/MalikHw"
         )
     
+    def changeEvent(self, event):
+        """Handle window state changes"""
+        if event.type() == event.Type.WindowStateChange:
+            if self.windowState() & Qt.WindowState.WindowMinimized:
+                if self.tray_icon and self.tray_icon.isVisible():
+                    self.hide()
+                    self.tray_icon.showMessage(
+                        "Flatpakky", 
+                        "Application minimized to tray", 
+                        QSystemTrayIcon.MessageIcon.Information, 
+                        2000
+                    )
+        super().changeEvent(event)
+    
     def closeEvent(self, event):
         """Handle window close event"""
+        if self.tray_icon and self.tray_icon.isVisible():
+            reply = QMessageBox.question(
+                self, 'Quit Application',
+                'Do you want to quit the application or minimize to tray?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                self.quit_application_cleanup()
+                event.accept()
+            elif reply == QMessageBox.StandardButton.No:
+                self.hide()
+                event.ignore()
+            else:
+                event.ignore()
+        else:
+            self.quit_application_cleanup()
+            event.accept()
+    
+    def quit_application_cleanup(self):
+        """Clean up before quitting"""
         # Stop all icon loaders
         for loader in self.icon_loaders:
             if loader.isRunning():
                 loader.terminate()
                 loader.wait()
         
-        # Stop timer
+        # Stop timers
         if hasattr(self, 'update_timer'):
             self.update_timer.stop()
+        if hasattr(self, 'search_timer'):
+            self.search_timer.stop()
         
-        event.accept()
+        # Hide tray icon
+        if self.tray_icon:
+            self.tray_icon.hide()
 
 class FlatpakkyApp(QApplication):
     """Main application class"""
@@ -833,8 +1208,11 @@ class FlatpakkyApp(QApplication):
     def __init__(self, argv):
         super().__init__(argv)
         self.setApplicationName("Flatpakky")
-        self.setApplicationVersion("1.0")
+        self.setApplicationVersion("1.1")
         self.setOrganizationName("MalikHw47")
+        
+        # Set application icon
+        self.setWindowIcon(self.get_app_icon())
         
         # Set application style
         self.setStyle('Fusion')
@@ -853,6 +1231,21 @@ class FlatpakkyApp(QApplication):
         if self.flatpakref_file:
             self.handle_flatpakref_file()
     
+    def get_app_icon(self):
+        """Get application icon from logo.png or use default"""
+        icon_paths = [
+            "logo.png",  # Same directory as script
+            os.path.join(os.path.dirname(__file__), "logo.png"),  # Explicit path
+            os.path.join(sys._MEIPASS, "logo.png") if hasattr(sys, '_MEIPASS') else None,  # PyInstaller bundle
+        ]
+        
+        for path in icon_paths:
+            if path and os.path.exists(path):
+                return QIcon(path)
+        
+        # Use default application icon
+        return QIcon()
+    
     def handle_flatpakref_file(self):
         """Handle .flatpakref file passed as argument"""
         reply = QMessageBox.question(
@@ -867,7 +1260,13 @@ class FlatpakkyApp(QApplication):
                 QMessageBox.information(self.main_window, "Success", "Application installed successfully!")
                 self.main_window.load_installed_apps()
             except Exception as e:
-                QMessageBox.warning(self.main_window, "Installation Failed", f"Failed to install: {str(e)}")
+                error_dialog = ErrorDialog(
+                    "Installation Failed",
+                    f"Failed to install from {os.path.basename(self.flatpakref_file)}",
+                    str(e),
+                    self.main_window
+                )
+                error_dialog.exec()
 
 def main():
     """Main entry point"""
